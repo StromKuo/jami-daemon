@@ -253,7 +253,12 @@ ifdef HAVE_WIN32
 FFMPEGCONF += \
 	--enable-indev=dshow \
 	--enable-indev=gdigrab \
-	--enable-dxva2
+	--enable-d3d11va \
+	--enable-dxva2 \
+	--enable-hwaccel=h264_d3d11va \
+	--enable-hwaccel=hevc_d3d11va \
+	--enable-hwaccel=h264_dxva2 \
+	--enable-hwaccel=hevc_dxva2
 endif
 
 ifdef HAVE_LINUX

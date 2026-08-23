@@ -661,6 +661,15 @@ MediaEncoder::forcePresetX2645(AVCodecContext* encoderCtx)
             JAMI_WARNING("Failed to set level to 'auto'");
         if (av_opt_set_int(encoderCtx, "zerolatency", 1, AV_OPT_SEARCH_CHILDREN))
             JAMI_WARNING("Failed to set zerolatency to '1'");
+    } else if (accel_ && accel_->getName() == "amf") {
+        // AMF has its own rate-control and latency options; x264's preset and
+        // tune options are not meaningful for the AMF encoder.
+        if (av_opt_set(encoderCtx, "usage", "lowlatency_high_quality", AV_OPT_SEARCH_CHILDREN))
+            JAMI_WARNING("Failed to set AMF usage to 'lowlatency_high_quality'");
+        if (av_opt_set(encoderCtx, "quality", "balanced", AV_OPT_SEARCH_CHILDREN))
+            JAMI_WARNING("Failed to set AMF quality to 'balanced'");
+        if (av_opt_set_int(encoderCtx, "bf", 0, AV_OPT_SEARCH_CHILDREN))
+            JAMI_WARNING("Failed to disable AMF B-frames");
     } else
 #endif
     {
@@ -1058,6 +1067,13 @@ MediaEncoder::initAccel(AVCodecContext* encoderCtx, uint64_t br)
         return;
     if (accel_->getName() == "nvenc"sv) {
         // Use same parameters as software
+    } else if (accel_->getName() == "amf"sv) {
+        // Keep a deterministic CBR target for the first AMF implementation.
+        // Runtime bitrate changes are deliberately disabled until they are
+        // verified on both AMD and Intel Windows test machines.
+        av_opt_set(encoderCtx, "rc", "cbr", AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(encoderCtx, "b", static_cast<int64_t>(val), AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(encoderCtx, "maxrate", static_cast<int64_t>(val), AV_OPT_SEARCH_CHILDREN);
     } else if (accel_->getName() == "vaapi"sv) {
         // Use VBR encoding with bitrate target set to 80% of the maxrate
         av_opt_set_int(encoderCtx, "crf", -1, AV_OPT_SEARCH_CHILDREN);

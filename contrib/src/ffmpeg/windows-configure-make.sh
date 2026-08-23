@@ -154,7 +154,12 @@ elif [ "$1" == "win32" ]; then
     FFMPEGCONF+='
                 --enable-indev=dshow
                 --enable-indev=gdigrab
+                --enable-d3d11va
                 --enable-dxva2
+                --enable-hwaccel=h264_d3d11va
+                --enable-hwaccel=hevc_d3d11va
+                --enable-hwaccel=h264_dxva2
+                --enable-hwaccel=hevc_dxva2
                 --enable-indev=dxgigrab'
     FFMPEGCONF+='
                 --enable-ffnvcodec
@@ -179,6 +184,13 @@ elif [ "$1" == "win32" ]; then
                 --enable-decoder=vp9_qsv
                 --enable-filter=scale_qsv
                 --enable-filter=overlay_qsv'
+    if [ -d "../../../../../msvc/include/AMF" ]; then
+        EXTRACFLAGS+=" -I../../../../../msvc/include/AMF"
+        FFMPEGCONF+=' --enable-amf --enable-encoder=h264_amf --enable-encoder=hevc_amf'
+        echo "AMF headers found; enabling FFmpeg AMF encoders..."
+    else
+        echo "AMF headers not found; FFmpeg AMF encoders remain disabled."
+    fi
     if [ "$2" == "x64" ]; then
         echo "configure and make ffmpeg for win32-x64..."
         EXTRALDFLAGS='-APPCONTAINER:NO -MACHINE:x64 Ole32.lib Kernel32.lib Gdi32.lib User32.lib Strmiids.lib Advapi32.lib OleAut32.lib Shlwapi.lib Vfw32.lib Secur32.lib Advapi32.lib libopus.lib libx264.lib libvpx.lib libmfx.lib -LIBPATH:../../../../../msvc/lib/x64'
