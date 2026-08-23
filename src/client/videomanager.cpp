@@ -517,8 +517,14 @@ registerSinkTarget(const std::string& sinkId, SinkTarget target)
     if (auto sink = jami::Manager::instance().getSinkClient(sinkId)) {
         sink->registerTarget(std::move(target));
         return true;
-    } else
-        JAMI_WARNING("No sink found for id '{}'", sinkId);
+    } else {
+        // The Android view can register its Surface before the call pipeline
+        // has created the corresponding SinkClient. Keep the target so the
+        // first SinkClient for this id can use MediaCodec Surface output.
+        jami::Manager::instance().registerPendingSinkTarget(sinkId, std::move(target));
+        JAMI_LOG("No sink found for id '{}'; keeping target for future sink", sinkId);
+        return true;
+    }
 #endif
     return false;
 }

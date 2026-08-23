@@ -47,6 +47,10 @@ class ChannelSocket;
 class IceTransportFactory;
 } // namespace dhtnet
 
+namespace libjami {
+struct SinkTarget;
+}
+
 namespace jami {
 namespace video {
 class SinkClient;
@@ -848,6 +852,10 @@ public:
      * @return share_ptr<SinkClient> A shared pointer on the created instance.
      */
     std::shared_ptr<video::SinkClient> createSinkClient(const std::string& id = "", bool mixer = false);
+
+    // Keep an Android/native sink target until the corresponding video sink
+    // is created by the call pipeline.
+    void registerPendingSinkTarget(const std::string& id, libjami::SinkTarget target);
 
     /**
      * Create a SinkClient instance for each participant in a conference, store it in an internal

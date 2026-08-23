@@ -27,6 +27,7 @@ extern "C" {
 }
 
 #include <unistd.h>
+#include <chrono>
 
 namespace jami {
 namespace video {
@@ -143,6 +144,26 @@ VideoReceiveThread::setup()
         // Now replace our custom AVIOContext with one that will read packets
         videoDecoder_->setIOContext(demuxContext_.get());
     }
+
+    // Probe the stream before opening MediaCodec. The Android client receives
+    // DecodingStarted from startSink(), and uses that signal to register the
+    // TextureView Surface. Opening the decoder first creates a ByteBuffer
+    // decoder; replacing it while packets are already arriving can lose the
+    // H.264 reference frame and leave the vendor decoder wedged.
+    if (videoDecoder_->prepare(AVMEDIA_TYPE_VIDEO) < 0) {
+        JAMI_ERROR("Unable to prepare video stream");
+        return false;
+    }
+
+    if (dstWidth_ == 0 and dstHeight_ == 0) {
+        dstWidth_ = videoDecoder_->getWidth();
+        dstHeight_ = videoDecoder_->getHeight();
+    }
+
+    if (useSink_ and dstWidth_ > 0 and dstHeight_ > 0) {
+        startSink();
+
+    }
     return true;
 }
 
@@ -209,6 +230,7 @@ VideoReceiveThread::decodeFrame()
             JAMI_LOG("[{:p}] Decoder configured, starting decoding", fmt::ptr(this));
         }
     }
+
     auto status = videoDecoder_->decode();
     if (status == MediaDemuxer::Status::EndOfFile) {
         JAMI_LOG("[{:p}] End of file", fmt::ptr(this));
@@ -233,6 +255,30 @@ VideoReceiveThread::configureVideoOutput()
         return false;
     }
 
+    if (not sink_->start()) {
+        JAMI_ERROR("RX: sink startup failed");
+        stopLoop();
+        return false;
+    }
+
+    if (useSink_ and not sinkStarted_)
+        startSink();
+
+#ifdef __ANDROID__
+    if (useSink_) {
+        // decodingStarted is delivered asynchronously to Android. Do not
+        // create MediaCodec before registerVideoCallback has supplied the
+        // output Surface, otherwise FFmpeg enters ByteBuffer mode.
+        if (sink_->waitForNativeWindow(std::chrono::milliseconds(1500))) {
+            videoDecoder_->setNativeWindow(sink_->getNativeWindow());
+            videoDecoder_->setSurface(sink_->getSurface());
+            JAMI_LOG("Android video output Surface is ready before decoder setup");
+        } else {
+            JAMI_WARNING("Android video output Surface was not registered before decoder setup; using software output");
+        }
+    }
+#endif
+
     if (videoDecoder_->setupVideo() < 0) {
         JAMI_ERROR("Decoder IO startup failed");
         stopLoop();
@@ -244,15 +290,6 @@ VideoReceiveThread::configureVideoOutput()
         dstWidth_ = videoDecoder_->getWidth();
         dstHeight_ = videoDecoder_->getHeight();
     }
-
-    if (not sink_->start()) {
-        JAMI_ERROR("RX: sink startup failed");
-        stopLoop();
-        return false;
-    }
-
-    if (useSink_)
-        startSink();
 
     if (onSuccessfulSetup_)
         onSuccessfulSetup_(MEDIA_VIDEO, 1);
@@ -270,6 +307,7 @@ VideoReceiveThread::stopSink()
 
     detach(sink_.get());
     sink_->setFrameSize(0, 0);
+    sinkStarted_ = false;
 }
 
 void
@@ -280,8 +318,10 @@ VideoReceiveThread::startSink()
     if (!loop_.isRunning())
         return;
 
-    if (dstWidth_ > 0 and dstHeight_ > 0 and attach(sink_.get()))
+    if (dstWidth_ > 0 and dstHeight_ > 0 and attach(sink_.get())) {
         sink_->setFrameSize(dstWidth_, dstHeight_);
+        sinkStarted_ = true;
+    }
 }
 
 int

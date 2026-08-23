@@ -41,6 +41,8 @@
 #include <string>
 #include <memory>
 #include <queue>
+#include <chrono>
+#include <cstdint>
 
 extern "C" {
 struct AVCodecContext;
@@ -148,6 +150,15 @@ private:
     std::function<void()> needFrameCb_;
     std::function<void(bool)> fileFinishedCb_;
     std::function<void()> keyFrameRequestCb_;
+    std::chrono::steady_clock::time_point videoStatsLastLog_ {};
+    uint64_t videoPacketsRead_ {0};
+    uint64_t videoPacketsMissingPts_ {0};
+    uint64_t videoBytesRead_ {0};
+    uint64_t videoPacketsLastLog_ {0};
+    uint64_t videoMissingPtsLastLog_ {0};
+    uint64_t videoBytesLastLog_ {0};
+    int64_t videoLastPts_ {0};
+    int64_t videoLastDts_ {0};
     void clearFrames();
     bool pushFrameFrom(std::queue<std::unique_ptr<AVPacket, std::function<void(AVPacket*)>>>& buffer,
                        bool isAudio,
@@ -174,6 +185,10 @@ public:
     void setInterruptCallback(int (*cb)(void*), void* opaque);
     void setIOContext(MediaIOHandle* ioctx);
 
+    // Probe and select a stream without opening its codec. This lets clients
+    // publish the stream dimensions before decoder setup, which is needed on
+    // Android so a Surface can be registered before MediaCodec is created.
+    int prepare(AVMediaType type);
     int setup(AVMediaType type);
     int setupAudio() { return setup(AVMEDIA_TYPE_AUDIO); }
     int setupVideo() { return setup(AVMEDIA_TYPE_VIDEO); }
@@ -186,6 +201,14 @@ public:
     int getHeight() const;
     std::string getDecoderName() const;
     bool isReady() const noexcept { return decoderReady_; }
+    bool isSurfaceOutput() const noexcept;
+
+    // On Android, use the supplied ANativeWindow as the MediaCodec output
+    // surface when the selected decoder supports it.
+    void setNativeWindow(void* window) noexcept { nativeWindow_ = window; }
+    // On Android, keep the Java Surface available as well. This mirrors the
+    // FFmpeg/Firefox MediaCodec setup and is needed by some codec wrappers.
+    void setSurface(void* surface) noexcept { surface_ = surface; }
 
     rational<double> getFps() const;
     AVPixelFormat getPixelFormat() const;
@@ -233,6 +256,7 @@ private:
 
     int correctPixFmt(int input_pix_fmt);
     int setupStream();
+    void logVideoStats(bool force = false);
 
     bool fallback_ = false;
 
@@ -247,6 +271,18 @@ private:
     void resetSeekTime() { seekTime_ = -1; }
     std::function<void(int, int)> resolutionChangedCallback_;
 
+    std::chrono::steady_clock::time_point decodeStatsLastLog_ {};
+    uint64_t decodePackets_ {0};
+    uint64_t decodeMissingPts_ {0};
+    uint64_t decodeFrames_ {0};
+    uint64_t decodeSendErrors_ {0};
+    uint64_t decodeReceiveErrors_ {0};
+    uint64_t decodeSendEagain_ {0};
+    uint64_t decodeReceiveEagain_ {0};
+    uint64_t decodeDrainFrames_ {0};
+    uint64_t decodePacketsLastLog_ {0};
+    uint64_t decodeFramesLastLog_ {0};
+
     int width_;
     int height_;
 
@@ -254,6 +290,9 @@ private:
 
     std::function<void()> contextCallback_;
     std::atomic_bool firstDecode_ {true};
+
+    void* nativeWindow_ {nullptr};
+    void* surface_ {nullptr};
 
 protected:
     AVDictionary* options_ = nullptr;

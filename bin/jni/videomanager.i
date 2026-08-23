@@ -54,6 +54,7 @@ public:
 %{
 
 std::map<ANativeWindow*, libjami::FrameBuffer> windows {};
+std::map<ANativeWindow*, jobject> mediaCodecSurfaces {};
 std::mutex windows_mutex;
 
 std::vector<uint8_t> workspace;
@@ -361,14 +362,45 @@ JNIEXPORT jboolean JNICALL Java_net_jami_daemon_JamiServiceJNI_registerVideoCall
     jenv->ReleaseStringUTFChars(sinkId, arg1_pstr);
 
     ANativeWindow* nativeWindow = (ANativeWindow*)((intptr_t) window);
+    jobject surface = ANativeWindow_toSurface(jenv, nativeWindow);
+    jobject surfaceGlobal = surface ? jenv->NewGlobalRef(surface) : nullptr;
+    if (surface)
+        jenv->DeleteLocalRef(surface);
     auto f_display_cb = std::bind(&AndroidDisplayCb, nativeWindow, std::placeholders::_1);
     auto p_display_cb = std::bind(&sinkTargetPullCallback, nativeWindow);
 
     {
         std::lock_guard guard(windows_mutex);
+        if (auto old = mediaCodecSurfaces.find(nativeWindow); old != mediaCodecSurfaces.end()) {
+            if (old->second)
+                jenv->DeleteGlobalRef(old->second);
+            mediaCodecSurfaces.erase(old);
+        }
+        if (surfaceGlobal)
+            mediaCodecSurfaces.emplace(nativeWindow, surfaceGlobal);
         windows.emplace(nativeWindow, libjami::FrameBuffer{av_frame_alloc()});
     }
-    return libjami::registerSinkTarget(sink, libjami::SinkTarget {.pull=p_display_cb, .push=f_display_cb}) ? JNI_TRUE : JNI_FALSE;
+    const bool registered = libjami::registerSinkTarget(
+        sink,
+        libjami::SinkTarget {.pull=p_display_cb, .push=f_display_cb,
+                             .nativeWindow=nativeWindow, .surface=surfaceGlobal});
+    __android_log_print(ANDROID_LOG_INFO,
+                        TAG,
+                        "registerVideoCallback sink=%s window=%p surface=%p registered=%d",
+                        sink.c_str(),
+                        nativeWindow,
+                        surfaceGlobal,
+                        registered ? 1 : 0);
+    if (!registered) {
+        std::lock_guard guard(windows_mutex);
+        auto old = mediaCodecSurfaces.find(nativeWindow);
+        if (old != mediaCodecSurfaces.end()) {
+            if (old->second)
+                jenv->DeleteGlobalRef(old->second);
+            mediaCodecSurfaces.erase(old);
+        }
+    }
+    return registered ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_net_jami_daemon_JamiServiceJNI_unregisterVideoCallback(JNIEnv *jenv, jclass jcls, jstring sinkId, jlong window)
@@ -387,6 +419,11 @@ JNIEXPORT void JNICALL Java_net_jami_daemon_JamiServiceJNI_unregisterVideoCallba
     libjami::registerSinkTarget(sink, libjami::SinkTarget {});
 
     std::lock_guard guard(windows_mutex);
+    if (auto surface = mediaCodecSurfaces.find(nativeWindow); surface != mediaCodecSurfaces.end()) {
+        if (surface->second)
+            jenv->DeleteGlobalRef(surface->second);
+        mediaCodecSurfaces.erase(surface);
+    }
     windows.erase(nativeWindow);
 }
 

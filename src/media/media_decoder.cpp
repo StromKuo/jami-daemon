@@ -28,6 +28,13 @@
 #include "video/accel.h"
 #endif
 
+#ifdef __ANDROID__
+extern "C" {
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_mediacodec.h>
+}
+#endif
+
 #include "string_utils.h"
 #include "logger.h"
 #include "client/jami_signal.h"
@@ -449,6 +456,40 @@ MediaDemuxer::decode()
         return Status::Success;
     }
 
+    if (inputParams_.format == "sdp"
+        && inputCtx_->streams[streamIndex]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        ++videoPacketsRead_;
+        videoBytesRead_ += packet->size;
+        videoLastPts_ = packet->pts;
+        videoLastDts_ = packet->dts;
+        if (packet->pts == AV_NOPTS_VALUE)
+            ++videoPacketsMissingPts_;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (videoStatsLastLog_ == std::chrono::steady_clock::time_point {}
+            || now - videoStatsLastLog_ >= std::chrono::seconds(1)) {
+            const auto elapsed = videoStatsLastLog_ == std::chrono::steady_clock::time_point {}
+                                     ? 1.0
+                                     : std::chrono::duration<double>(now - videoStatsLastLog_).count();
+            JAMI_LOG("[RTPDemux:{}] packets={} (+{:.1f}/s) bytes={} (+{:.1f} KB/s) "
+                     "missing_pts={} (+{}) last_pts={} last_dts={} packet_size={}",
+                     fmt::ptr(this),
+                     videoPacketsRead_,
+                     (videoPacketsRead_ - videoPacketsLastLog_) / elapsed,
+                     videoBytesRead_,
+                     (videoBytesRead_ - videoBytesLastLog_) / elapsed / 1024.0,
+                     videoPacketsMissingPts_,
+                     videoPacketsMissingPts_ - videoMissingPtsLastLog_,
+                     videoLastPts_,
+                     videoLastDts_,
+                     packet->size);
+            videoStatsLastLog_ = now;
+            videoPacketsLastLog_ = videoPacketsRead_;
+            videoMissingPtsLastLog_ = videoPacketsMissingPts_;
+            videoBytesLastLog_ = videoBytesRead_;
+        }
+    }
+
     lastReadPacketTime_ = av_gettime_relative();
 
     auto& cb = streams_[streamIndex];
@@ -456,6 +497,8 @@ MediaDemuxer::decode()
         DecodeStatus ret = cb(*packet.get());
         if (ret == DecodeStatus::FallBack)
             return Status::FallBack;
+        if (ret == DecodeStatus::DecodeError)
+            return Status::ReadError;
     }
     return Status::Success;
 }
@@ -536,6 +579,14 @@ MediaDecoder::setKeyFrameRequestCb(std::function<void()> cb)
 int
 MediaDecoder::setup(AVMediaType type)
 {
+    if (prepare(type) < 0)
+        return -1;
+    return setupStream();
+}
+
+int
+MediaDecoder::prepare(AVMediaType type)
+{
     demuxer_->findStreamInfo(type == AVMEDIA_TYPE_VIDEO);
     auto stream = demuxer_->selectStream(type);
     if (stream < 0) {
@@ -548,7 +599,7 @@ MediaDecoder::setup(AVMediaType type)
         return -1;
     }
     demuxer_->setStreamCallback(stream, [this](AVPacket& packet) { return decode(packet); });
-    return setupStream();
+    return 0;
 }
 
 int
@@ -561,12 +612,19 @@ MediaDecoder::setupStream()
     if (prepareDecoderContext() < 0)
         return -1; // failed
 
+#ifdef __ANDROID__
+    const bool useMediaCodecSurface = nativeWindow_ && decoderCtx_->codec_id == AV_CODEC_ID_H264;
+#else
+    const bool useMediaCodecSurface = false;
+#endif
+    bool mediaCodecSurfaceReady = false;
+
 #ifdef ENABLE_HWACCEL
     // if there was a fallback to software decoding, do not enable accel
     // it has been disabled already by the video_receive_thread/video_input
     enableAccel_ &= Manager::instance().videoPreferences.getDecodingAccelerated();
 
-    if (enableAccel_ and not fallback_) {
+    if (enableAccel_ and not fallback_ and not useMediaCodecSurface) {
         auto APIs = video::HardwareAccel::getCompatibleAccel(decoderCtx_->codec_id,
                                                              decoderCtx_->width,
                                                              decoderCtx_->height,
@@ -603,6 +661,30 @@ MediaDecoder::setupStream()
     }
 #endif
 
+#ifdef __ANDROID__
+    if (nativeWindow_ && decoderCtx_->codec_id == AV_CODEC_ID_H264) {
+        auto* device = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_MEDIACODEC);
+        if (device) {
+            auto* deviceCtx = reinterpret_cast<AVHWDeviceContext*>(device->data);
+            auto* mediaCodecCtx = reinterpret_cast<AVMediaCodecDeviceContext*>(deviceCtx->hwctx);
+            mediaCodecCtx->surface = surface_;
+            mediaCodecCtx->native_window = nativeWindow_;
+            mediaCodecCtx->create_window = 0;
+            if (av_hwdevice_ctx_init(device) >= 0) {
+                decoderCtx_->hw_device_ctx = device;
+                mediaCodecSurfaceReady = true;
+                JAMI_LOG("Using Android MediaCodec output surface for {} (surface={}, nativeWindow={})",
+                         avcodec_get_name(decoderCtx_->codec_id), surface_, nativeWindow_);
+            } else {
+                JAMI_WARNING("Unable to initialize Android MediaCodec output surface; using buffer output");
+                av_buffer_unref(&device);
+            }
+        } else {
+            JAMI_WARNING("Unable to allocate Android MediaCodec device context; using buffer output");
+        }
+    }
+#endif
+
     JAMI_LOG("Using {} ({}) decoder for {}",
              inputDecoder_->long_name,
              inputDecoder_->name,
@@ -614,7 +696,8 @@ MediaDecoder::setupStream()
 
 #ifdef ENABLE_HWACCEL
     if (!accel_) {
-        JAMI_WARNING("Not using hardware decoding for {}", avcodec_get_name(decoderCtx_->codec_id));
+        if (!mediaCodecSurfaceReady)
+            JAMI_WARNING("Not using hardware decoding for {}", avcodec_get_name(decoderCtx_->codec_id));
         ret = avcodec_open2(decoderCtx_, inputDecoder_, nullptr);
     }
 #else
@@ -633,6 +716,15 @@ int
 MediaDecoder::prepareDecoderContext()
 {
     inputDecoder_ = findDecoder(avStream_->codecpar->codec_id);
+#ifdef __ANDROID__
+    // Only select the named MediaCodec decoder when the caller supplied an
+    // output window. Without a Surface it uses ByteBuffer output, which is
+    // not the zero-copy path needed by the Android TV renderer.
+    if (nativeWindow_ && avStream_->codecpar->codec_id == AV_CODEC_ID_H264) {
+        if (const auto* mediaCodecDecoder = avcodec_find_decoder_by_name("h264_mediacodec"))
+            inputDecoder_ = mediaCodecDecoder;
+    }
+#endif
     if (!inputDecoder_) {
         JAMI_ERROR("Unsupported codec");
         return -1;
@@ -674,16 +766,20 @@ MediaDecoder::updateStartTime(int64_t startTime)
 DecodeStatus
 MediaDecoder::decode(AVPacket& packet)
 {
+    const bool isVideo = inputDecoder_ && inputDecoder_->type == AVMEDIA_TYPE_VIDEO;
+    if (isVideo) {
+        ++decodePackets_;
+        if (packet.pts == AV_NOPTS_VALUE)
+            ++decodeMissingPts_;
+    }
+
     if (inputDecoder_->type == AVMEDIA_TYPE_VIDEO && passthrough_) {
 #ifdef ENABLE_VIDEO
-        // If passthrough, we don't decode, just pass the packet
         auto f = std::static_pointer_cast<MediaFrame>(std::make_shared<VideoFrame>());
-        if (auto p = av_packet_clone(&packet)) {
+        if (auto p = av_packet_clone(&packet))
             f->setPacket(libjami::PacketBuffer(p));
-        }
         if (callback_)
             callback_(std::move(f));
-
         if (contextCallback_ && firstDecode_.load()) {
             firstDecode_.exchange(false);
             contextCallback_();
@@ -692,113 +788,195 @@ MediaDecoder::decode(AVPacket& packet)
 #endif
     }
 
-    int frameFinished = 0;
-    auto ret = avcodec_send_packet(decoderCtx_, &packet);
-    // TODO: Investigate avcodec_send_packet returning AVERROR_INVALIDDATA.
-    // * Bug Windows documented here: git.jami.net/savoirfairelinux/jami-daemon/-/issues/1116
-    // where avcodec_send_packet returns AVERROR_INVALIDDATA when the size information in the
-    // packet is incorrect. Falling back onto sw decoding in this causes a segfault.
-    // * A second problem occurs on some Windows devices with intel CPUs in which hardware
-    // decoding fails with AVERROR_INVALIDDATA when using H.264. However, in this scenario,
-    // falling back to software decoding works fine.
-    // We need to figure out why this behavior occurs and how to discriminate between the two.
-    if (ret < 0 && ret != AVERROR(EAGAIN)) {
-#ifdef ENABLE_HWACCEL
-        if (accel_) {
-            JAMI_WARNING("Decoding error falling back to software");
-            fallback_ = true;
-            accel_.reset();
-            avcodec_flush_buffers(decoderCtx_);
-            setupStream();
-            return DecodeStatus::FallBack;
-        }
-#endif
-        avcodec_flush_buffers(decoderCtx_);
-        return ret == AVERROR_EOF ? DecodeStatus::Success : DecodeStatus::DecodeError;
+    // MediaCodec treats a missing PTS as zero. Give packets arriving through
+    // the custom ICE transport a monotonic timestamp instead.
+    if (inputDecoder_->type == AVMEDIA_TYPE_VIDEO && packet.pts == AV_NOPTS_VALUE) {
+        packet.pts = av_rescale_q(av_gettime() - startTime_,
+                                  {1, AV_TIME_BASE},
+                                  avStream_->time_base);
+        if (packet.dts == AV_NOPTS_VALUE)
+            packet.dts = packet.pts;
     }
 
-#ifdef ENABLE_VIDEO
-    auto f = (inputDecoder_->type == AVMEDIA_TYPE_VIDEO)
-                 ? std::static_pointer_cast<MediaFrame>(std::make_shared<VideoFrame>())
-                 : std::static_pointer_cast<MediaFrame>(std::make_shared<AudioFrame>());
-#else
-    auto f = std::static_pointer_cast<MediaFrame>(std::make_shared<AudioFrame>());
-#endif
-    auto* frame = f->pointer();
-    ret = avcodec_receive_frame(decoderCtx_, frame);
-    // time_base is not set in AVCodecContext for decoding
-    // fail to set it causes pts to be incorrectly computed down in the function
-    if (inputDecoder_->type == AVMEDIA_TYPE_VIDEO) {
-        decoderCtx_->time_base.num = decoderCtx_->framerate.den;
-        decoderCtx_->time_base.den = decoderCtx_->framerate.num;
-    } else {
-        decoderCtx_->time_base.num = 1;
-        decoderCtx_->time_base.den = decoderCtx_->sample_rate;
-    }
-    frame->time_base = decoderCtx_->time_base;
-    if (resolutionChangedCallback_) {
-        if (decoderCtx_->width != width_ or decoderCtx_->height != height_) {
-            JAMI_LOG("Resolution changed from {}x{} to {}x{}", width_, height_, decoderCtx_->width, decoderCtx_->height);
+    bool packetSent = false;
+    bool frameFinished = false;
+    bool outputForPacket = false;
+    int ret = 0;
+
+    auto processFrame = [&](std::shared_ptr<MediaFrame>& f) -> DecodeStatus {
+        auto* frame = f->pointer();
+        if (inputDecoder_->type == AVMEDIA_TYPE_VIDEO) {
+            decoderCtx_->time_base.num = decoderCtx_->framerate.den;
+            decoderCtx_->time_base.den = decoderCtx_->framerate.num;
+        } else {
+            decoderCtx_->time_base.num = 1;
+            decoderCtx_->time_base.den = decoderCtx_->sample_rate;
+        }
+        frame->time_base = decoderCtx_->time_base;
+
+        if (resolutionChangedCallback_ && (decoderCtx_->width != width_ || decoderCtx_->height != height_)) {
+            JAMI_LOG("Resolution changed from {}x{} to {}x{}",
+                     width_,
+                     height_,
+                     decoderCtx_->width,
+                     decoderCtx_->height);
             width_ = decoderCtx_->width;
             height_ = decoderCtx_->height;
             resolutionChangedCallback_(width_, height_);
         }
-    }
-    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
-        return DecodeStatus::DecodeError;
-    }
-    if (ret >= 0)
-        frameFinished = 1;
 
-    if (frameFinished) {
         if (inputDecoder_->type == AVMEDIA_TYPE_VIDEO) {
             frame->format = (AVPixelFormat) correctPixFmt(frame->format);
-        } else {
-            // It's possible (albeit rare) for avcodec_receive_frame to return a frame with
-            // unspecified channel order. This can cause issues later on in the resampler
-            // because swr_convert_frame expects the ch_layout of the input frame to match
-            // the in_ch_layout of the SwrContext, but swr_init sets in_ch_layout to a default
-            // value based on the number of channels if the channel order of the input frame
-            // is unspecified.
-            if (frame->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
-                av_channel_layout_default(&frame->ch_layout, frame->ch_layout.nb_channels);
-            }
+        } else if (frame->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
+            av_channel_layout_default(&frame->ch_layout, frame->ch_layout.nb_channels);
         }
-        auto packetTimestamp = frame->pts; // in stream time base
+
+        auto packetTimestamp = frame->pts;
         frame->pts = av_rescale_q_rnd(av_gettime() - startTime_,
                                       {1, AV_TIME_BASE},
                                       decoderCtx_->time_base,
                                       static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
         lastTimestamp_ = frame->pts;
-        if (emulateRate_ and packetTimestamp != AV_NOPTS_VALUE) {
+        if (emulateRate_ && packetTimestamp != AV_NOPTS_VALUE) {
             auto startTime = avStream_->start_time == AV_NOPTS_VALUE ? 0 : avStream_->start_time;
             rational<double> frame_time = rational<double>(getTimeBase())
                                           * rational<double>(static_cast<double>(packetTimestamp - startTime));
             auto target_relative = static_cast<std::int64_t>(frame_time.real() * 1e6);
             auto target_absolute = startTime_ + target_relative;
-            if (target_relative < seekTime_) {
+            if (target_relative < seekTime_)
                 return DecodeStatus::Success;
-            }
-            // required frame found. Reset seek time
-            if (target_relative >= seekTime_) {
+            if (target_relative >= seekTime_)
                 resetSeekTime();
-            }
             auto now = av_gettime();
-            if (target_absolute > now) {
+            if (target_absolute > now)
                 std::this_thread::sleep_for(std::chrono::microseconds(target_absolute - now));
-            }
         }
 
         if (callback_)
             callback_(std::move(f));
-
         if (contextCallback_ && firstDecode_.load()) {
             firstDecode_.exchange(false);
             contextCallback_();
         }
         return DecodeStatus::FrameFinished;
+    };
+
+    for (;;) {
+        if (!packetSent) {
+            ret = avcodec_send_packet(decoderCtx_, &packet);
+            if (ret == AVERROR(EAGAIN)) {
+                if (isVideo)
+                    ++decodeSendEagain_;
+            } else if (ret < 0) {
+                if (isVideo)
+                    ++decodeSendErrors_;
+#ifdef ENABLE_HWACCEL
+                if (accel_) {
+                    JAMI_WARNING("Decoding error falling back to software");
+                    fallback_ = true;
+                    accel_.reset();
+                    avcodec_flush_buffers(decoderCtx_);
+                    setupStream();
+                    return DecodeStatus::FallBack;
+                }
+#endif
+                avcodec_flush_buffers(decoderCtx_);
+                return ret == AVERROR_EOF ? DecodeStatus::Success : DecodeStatus::DecodeError;
+            } else {
+                packetSent = true;
+            }
+        }
+
+#ifdef ENABLE_VIDEO
+        auto f = (inputDecoder_->type == AVMEDIA_TYPE_VIDEO)
+                     ? std::static_pointer_cast<MediaFrame>(std::make_shared<VideoFrame>())
+                     : std::static_pointer_cast<MediaFrame>(std::make_shared<AudioFrame>());
+#else
+        auto f = std::static_pointer_cast<MediaFrame>(std::make_shared<AudioFrame>());
+#endif
+        ret = avcodec_receive_frame(decoderCtx_, f->pointer());
+        if (ret == 0) {
+            frameFinished = true;
+            if (isVideo) {
+                ++decodeFrames_;
+                if (outputForPacket || !packetSent)
+                    ++decodeDrainFrames_;
+                if (decodeFrames_ == 1) {
+                    JAMI_LOG("[VideoDecode:{}] first output frame format={} size={}x{} surface={}",
+                             fmt::ptr(this),
+                             f->pointer()->format,
+                             f->pointer()->width,
+                             f->pointer()->height,
+                             f->pointer()->format == AV_PIX_FMT_MEDIACODEC);
+                }
+            }
+            outputForPacket = true;
+            processFrame(f);
+            continue;
+        }
+
+        if (ret == AVERROR(EAGAIN)) {
+            if (isVideo)
+                ++decodeReceiveEagain_;
+            if (!packetSent) {
+                JAMI_ERROR("[VideoDecode:{}] avcodec_send_packet and avcodec_receive_frame both returned EAGAIN",
+                           fmt::ptr(this));
+                return DecodeStatus::DecodeError;
+            }
+            break;
+        }
+        if (ret == AVERROR_EOF)
+            break;
+
+        if (isVideo)
+            ++decodeReceiveErrors_;
+        JAMI_ERROR("[VideoDecode:{}] avcodec_receive_frame failed: {}",
+                   fmt::ptr(this),
+                   libav_utils::getError(ret));
+        return DecodeStatus::DecodeError;
     }
-    return DecodeStatus::Success;
+
+    if (isVideo)
+        logVideoStats();
+    return frameFinished ? DecodeStatus::FrameFinished : DecodeStatus::Success;
+}
+
+void
+MediaDecoder::logVideoStats(bool force)
+{
+    if (!inputDecoder_ || inputDecoder_->type != AVMEDIA_TYPE_VIDEO)
+        return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && decodeStatsLastLog_ != std::chrono::steady_clock::time_point {}
+        && now - decodeStatsLastLog_ < std::chrono::seconds(1))
+        return;
+
+    const auto elapsed = decodeStatsLastLog_ == std::chrono::steady_clock::time_point {}
+                             ? 1.0
+                             : std::chrono::duration<double>(now - decodeStatsLastLog_).count();
+    JAMI_LOG("[VideoDecode:{}] codec={} surface={} input={} (+{:.1f}/s) output={} (+{:.1f}/s) "
+             "missing_pts={} send_errors={} send_eagain={} receive_errors={} receive_eagain={} "
+             "drain_frames={} size={}x{} pix_fmt={}",
+             fmt::ptr(this),
+             inputDecoder_->name ? inputDecoder_->name : "unknown",
+             isSurfaceOutput(),
+             decodePackets_,
+             (decodePackets_ - decodePacketsLastLog_) / elapsed,
+             decodeFrames_,
+             (decodeFrames_ - decodeFramesLastLog_) / elapsed,
+             decodeMissingPts_,
+             decodeSendErrors_,
+             decodeSendEagain_,
+             decodeReceiveErrors_,
+             decodeReceiveEagain_,
+             decodeDrainFrames_,
+             decoderCtx_ ? decoderCtx_->width : 0,
+             decoderCtx_ ? decoderCtx_->height : 0,
+             decoderCtx_ ? static_cast<int>(decoderCtx_->pix_fmt) : static_cast<int>(AV_PIX_FMT_NONE));
+    decodeStatsLastLog_ = now;
+    decodePacketsLastLog_ = decodePackets_;
+    decodeFramesLastLog_ = decodeFrames_;
 }
 
 void
@@ -867,13 +1045,17 @@ MediaDecoder::flush()
 int
 MediaDecoder::getWidth() const
 {
-    return decoderCtx_ ? decoderCtx_->width : 0;
+    if (decoderCtx_)
+        return decoderCtx_->width;
+    return avStream_ && avStream_->codecpar ? avStream_->codecpar->width : 0;
 }
 
 int
 MediaDecoder::getHeight() const
 {
-    return decoderCtx_ ? decoderCtx_->height : 0;
+    if (decoderCtx_)
+        return decoderCtx_->height;
+    return avStream_ && avStream_->codecpar ? avStream_->codecpar->height : 0;
 }
 
 std::string
@@ -898,6 +1080,16 @@ AVPixelFormat
 MediaDecoder::getPixelFormat() const
 {
     return isReady() ? decoderCtx_->pix_fmt : AV_PIX_FMT_NONE;
+}
+
+bool
+MediaDecoder::isSurfaceOutput() const noexcept
+{
+#ifdef __ANDROID__
+    return isReady() && decoderCtx_ && decoderCtx_->pix_fmt == AV_PIX_FMT_MEDIACODEC;
+#else
+    return false;
+#endif
 }
 
 int

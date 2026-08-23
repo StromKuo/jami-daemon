@@ -38,6 +38,12 @@
 #include "accel.h"
 #endif
 
+#ifdef __ANDROID__
+extern "C" {
+#include <libavcodec/mediacodec.h>
+}
+#endif
+
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
@@ -49,6 +55,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <cmath>
+#include <algorithm>
 
 namespace jami {
 namespace video {
@@ -412,6 +419,61 @@ SinkClient::update(Observable<std::shared_ptr<MediaFrame>>* /*obs*/, const std::
 #endif
 
     std::unique_lock lock(mtx_);
+
+#ifdef __ANDROID__
+    // FFmpeg's MediaCodec surface decoder returns an opaque
+    // AVMediaCodecBuffer. The AVFrame release callback discards the codec
+    // buffer (render=0), so the consumer must explicitly release it with
+    // render=1 to submit the decoded frame to the Android Surface.
+    if (frame_p && frame_p->pointer()->format == AV_PIX_FMT_MEDIACODEC) {
+        auto* buffer = reinterpret_cast<AVMediaCodecBuffer*>(frame_p->pointer()->data[3]);
+        if (!buffer) {
+            JAMI_ERROR("[Sink:{}] MediaCodec frame has no output buffer", id_);
+            return;
+        }
+        const bool render = target_.nativeWindow || target_.surface;
+        ++mediaCodecFrames_;
+        if (render)
+            ++mediaCodecRenderFrames_;
+        const auto releaseStart = std::chrono::steady_clock::now();
+        const auto ret = av_mediacodec_release_buffer(buffer, render ? 1 : 0);
+        const auto releaseMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - releaseStart)
+                                   .count();
+        mediaCodecMaxReleaseMs_ = std::max(mediaCodecMaxReleaseMs_, static_cast<int64_t>(releaseMs));
+        if (ret < 0)
+            ++mediaCodecReleaseErrors_;
+        if (ret < 0)
+            JAMI_ERROR("[Sink:{}] Failed to release MediaCodec output buffer (render={})", id_, render);
+
+        const auto now = std::chrono::steady_clock::now();
+        if (mediaCodecStatsLastLog_ == std::chrono::steady_clock::time_point {}
+            || now - mediaCodecStatsLastLog_ >= std::chrono::seconds(1)) {
+            const auto elapsed = mediaCodecStatsLastLog_ == std::chrono::steady_clock::time_point {}
+                                     ? 1.0
+                                     : std::chrono::duration<double>(now - mediaCodecStatsLastLog_).count();
+            JAMI_LOG("[MediaCodecSurface:{}] frames={} (+{:.1f}/s) rendered={} (+{:.1f}/s) "
+                     "release_errors={} (+{}) max_release_ms={} nativeWindow={} surface={}",
+                     fmt::ptr(this),
+                     mediaCodecFrames_,
+                     (mediaCodecFrames_ - mediaCodecFramesLastLog_) / elapsed,
+                     mediaCodecRenderFrames_,
+                     (mediaCodecRenderFrames_ - mediaCodecRenderFramesLastLog_) / elapsed,
+                     mediaCodecReleaseErrors_,
+                     mediaCodecReleaseErrors_ - mediaCodecReleaseErrorsLastLog_,
+                     mediaCodecMaxReleaseMs_,
+                     target_.nativeWindow,
+                     target_.surface);
+            mediaCodecStatsLastLog_ = now;
+            mediaCodecFramesLastLog_ = mediaCodecFrames_;
+            mediaCodecRenderFramesLastLog_ = mediaCodecRenderFrames_;
+            mediaCodecReleaseErrorsLastLog_ = mediaCodecReleaseErrors_;
+            mediaCodecMaxReleaseMs_ = 0;
+        }
+        return;
+    }
+#endif
+
     bool hasObservers = getObserversCount() != 0;
     bool hasDirectListener = target_.push and not target_.pull;
     bool hasTransformedListener = target_.push and target_.pull;

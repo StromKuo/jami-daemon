@@ -57,6 +57,7 @@
 #endif
 
 #include "client/videomanager.h"
+#include "jami/videomanager_interface.h"
 
 #include "conference.h"
 
@@ -394,6 +395,7 @@ struct Manager::ManagerPimpl
 
     /* Sink ID mapping */
     std::map<std::string, std::weak_ptr<video::SinkClient>> sinkMap_;
+    std::map<std::string, libjami::SinkTarget> pendingSinkTargets_;
 
     std::unique_ptr<VideoManager> videoManager_;
 
@@ -3140,7 +3142,21 @@ Manager::createSinkClient(const std::string& id, bool mixer)
         return sink;
     auto sink = std::make_shared<video::SinkClient>(id, mixer);
     sinkRef = sink;
+    if (auto target = pimpl_->pendingSinkTargets_.find(id); target != pimpl_->pendingSinkTargets_.end()) {
+        sink->registerTarget(std::move(target->second));
+        pimpl_->pendingSinkTargets_.erase(target);
+    }
     return sink;
+}
+
+void
+Manager::registerPendingSinkTarget(const std::string& id, libjami::SinkTarget target)
+{
+    std::lock_guard lk(pimpl_->sinksMutex_);
+    if (target.pull || target.push || target.nativeWindow || target.surface)
+        pimpl_->pendingSinkTargets_[id] = std::move(target);
+    else
+        pimpl_->pendingSinkTargets_.erase(id);
 }
 
 void

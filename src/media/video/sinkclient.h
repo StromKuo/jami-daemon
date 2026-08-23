@@ -25,6 +25,9 @@
 
 #include <string>
 #include <memory>
+#include <condition_variable>
+#include <chrono>
+#include <cstdint>
 
 // #define DEBUG_FPS
 
@@ -56,6 +59,24 @@ public:
 
     AVPixelFormat getPreferredFormat() const noexcept { return (AVPixelFormat) target_.preferredFormat; }
 
+    void* getNativeWindow() noexcept
+    {
+        std::lock_guard lock(mtx_);
+        return target_.nativeWindow;
+    }
+
+    void* getSurface() noexcept
+    {
+        std::lock_guard lock(mtx_);
+        return target_.surface;
+    }
+
+    bool waitForNativeWindow(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock(mtx_);
+        return targetCv_.wait_for(lock, timeout, [this] { return target_.nativeWindow != nullptr; });
+    }
+
     // as VideoFramePassiveReader
     void update(Observable<std::shared_ptr<jami::MediaFrame>>*, const std::shared_ptr<jami::MediaFrame>&) override;
 
@@ -67,8 +88,11 @@ public:
 
     void registerTarget(libjami::SinkTarget target) noexcept
     {
-        std::lock_guard lock(mtx_);
-        target_ = std::move(target);
+        {
+            std::lock_guard lock(mtx_);
+            target_ = std::move(target);
+        }
+        targetCv_.notify_all();
     }
 
 #ifdef ENABLE_SHM
@@ -94,6 +118,16 @@ private:
     std::unique_ptr<VideoScaler> scaler_;
     std::unique_ptr<MediaFilter> filter_;
     std::mutex mtx_;
+    std::condition_variable targetCv_;
+
+    std::chrono::steady_clock::time_point mediaCodecStatsLastLog_ {};
+    uint64_t mediaCodecFrames_ {0};
+    uint64_t mediaCodecRenderFrames_ {0};
+    uint64_t mediaCodecReleaseErrors_ {0};
+    uint64_t mediaCodecFramesLastLog_ {0};
+    uint64_t mediaCodecRenderFramesLastLog_ {0};
+    uint64_t mediaCodecReleaseErrorsLastLog_ {0};
+    int64_t mediaCodecMaxReleaseMs_ {0};
 
     libjami::FrameBuffer configureFrameDirect(const std::shared_ptr<jami::MediaFrame>&);
     void sendFrameTransformed(AVFrame* frame);

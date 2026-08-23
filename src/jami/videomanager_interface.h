@@ -171,6 +171,12 @@ struct LIBJAMI_PUBLIC SinkTarget
     std::function<FrameBuffer()> pull;
     std::function<void(FrameBuffer)> push;
     int /* AVPixelFormat */ preferredFormat {-1 /* AV_PIX_FMT_NONE */};
+    // Optional platform-native output target. Android MediaCodec can decode
+    // directly to this window and bypass the CPU YUV-to-RGBA conversion.
+    void* nativeWindow {nullptr};
+    // Optional Java android.view.Surface global reference. FFmpeg's Android
+    // MediaCodec path accepts both this Surface and the ANativeWindow.
+    void* surface {nullptr};
 };
 
 using VideoCapabilities = std::map<std::string, std::map<std::string, std::vector<std::string>>>;
