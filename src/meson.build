@@ -21,6 +21,7 @@ libjami_sources = files(
     'jamidht/archive_account_manager.cpp',
     'jamidht/auth_channel_handler.cpp',
     'jamidht/channeled_transport.cpp',
+    'jamidht/collaborative_editing.cpp',
     'jamidht/contact_list.cpp',
     'jamidht/conversation.cpp',
     'jamidht/conversation_channel_handler.cpp',
@@ -48,6 +49,8 @@ libjami_sources = files(
     'jamidht/sync_module.cpp',
     'jamidht/transfer_channel_handler.cpp',
     'jamidht/typers.cpp',
+    'jamidht/ydoc_channel_handler.cpp',
+    'jamidht/yrs_document.cpp',
     'media/audio/audio-processing/null_audio_processor.cpp',
     'media/audio/audio_frame_resizer.cpp',
     'media/audio/audio_input.cpp',
@@ -141,6 +144,7 @@ libjami_dependencies = [
     depjsoncpp,
     depsimdutf,
     depzlib,
+    depyrs,
     depopenssl,
 ]
 
@@ -313,6 +317,7 @@ if get_option('interfaces').contains('library')
         'jami/def.h',
         'jami/jami.h',
         'jami/media_const.h',
+        'jami/networkservice_interface.h',
         'jami/presence_const.h',
         'jami/presencemanager_interface.h',
         'jami/security_const.h',
