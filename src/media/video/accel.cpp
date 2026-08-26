@@ -97,18 +97,6 @@ static std::list<HardwareAPI> apiListDec = {
 };
 
 static std::list<HardwareAPI> apiListEnc = {
-#ifdef _WIN32
-    // AMF is available through FFmpeg when it is built with AMD AMF headers.
-    // Keep runtime capability probing in HardwareAccel instead of assuming an
-    // AMD device is present on every Windows host.
-    {"amf",
-     AV_HWDEVICE_TYPE_AMF,
-     AV_PIX_FMT_AMF_SURFACE,
-     AV_PIX_FMT_NV12,
-     {AV_CODEC_ID_H264, AV_CODEC_ID_HEVC},
-     {{"default", DeviceState::NOT_TESTED}},
-     false},
-#endif
     {"nvenc",
      AV_HWDEVICE_TYPE_CUDA,
      AV_PIX_FMT_CUDA,

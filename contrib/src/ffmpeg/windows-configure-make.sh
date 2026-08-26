@@ -184,8 +184,7 @@ elif [ "$1" == "win32" ]; then
                 --enable-decoder=vp9_qsv
                 --enable-filter=scale_qsv
                 --enable-filter=overlay_qsv'
-    if [ -d "../../../../../msvc/include/AMF" ]; then
-        EXTRACFLAGS+=" -I../../../../../msvc/include/AMF"
+    if [ -f "../../msvc/include/AMF/core/Version.h" ]; then
         FFMPEGCONF+=' --enable-amf --enable-encoder=h264_amf --enable-encoder=hevc_amf'
         echo "AMF headers found; enabling FFmpeg AMF encoders..."
     else

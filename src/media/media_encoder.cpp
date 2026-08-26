@@ -262,48 +262,80 @@ MediaEncoder::initStream(const SystemCodecInfo& systemCodecInfo, AVBufferRef* fr
 
     currentStreamIdx_ = stream->index;
 #ifdef ENABLE_HWACCEL
+    if (mediaType == AVMEDIA_TYPE_VIDEO)
+        useAmfEncoder_ = false;
     // Get compatible list of Hardware API
     if (enableAccel_ && mediaType == AVMEDIA_TYPE_VIDEO) {
-        auto APIs = video::HardwareAccel::getCompatibleAccel(static_cast<AVCodecID>(systemCodecInfo.avcodecId),
-                                                             videoOpts_.width,
-                                                             videoOpts_.height,
-                                                             CODEC_ENCODER);
-        for (const auto& it : APIs) {
-            accel_ = std::make_unique<video::HardwareAccel>(it); // save accel
-            // Init codec need accel_ to init encoderCtx accelerated
-            encoderCtx = initCodec(mediaType, static_cast<AVCodecID>(systemCodecInfo.avcodecId), videoOpts_.bitrate);
-            encoderCtx->opaque = accel_.get();
-            // Check if pixel format from encoder match pixel format from decoder frame context
-            // if it mismatch, it means that we are using two different hardware API (nvenc and
-            // vaapi for example) in this case we don't want link the APIs
-            if (framesCtx) {
-                auto* hw = reinterpret_cast<AVHWFramesContext*>(framesCtx->data);
-                if (encoderCtx->pix_fmt != hw->format)
-                    linkableHW_ = false;
-            }
-            auto ret = accel_->initAPI(linkableHW_, framesCtx);
-            if (ret < 0) {
-                accel_.reset();
-                encoderCtx = nullptr;
-                continue;
-            }
-            accel_->setDetails(encoderCtx);
+#ifdef _WIN32
+        const auto codecId = static_cast<AVCodecID>(systemCodecInfo.avcodecId);
+        const char* amfCodecName = nullptr;
+        if (codecId == AV_CODEC_ID_H264)
+            amfCodecName = "h264_amf";
+        else if (codecId == AV_CODEC_ID_HEVC)
+            amfCodecName = "hevc_amf";
+
+        // FFmpeg 6.0.1 exposes AMF as an encoder-only backend. Do not route it
+        // through HardwareAccel: that class requires an AVHWDeviceType and an
+        // AVHWFramesContext, neither of which exists for AMF in this FFmpeg.
+        if (amfCodecName && avcodec_find_encoder_by_name(amfCodecName)) {
+            useAmfEncoder_ = true;
+            encoderCtx = initCodec(mediaType, codecId, videoOpts_.bitrate);
             if (avcodec_open2(encoderCtx, outputCodec_, &options_) < 0) {
-                // Failed to open codec
-                JAMI_WARNING("Fail to open hardware encoder {} with {} ",
-                             avcodec_get_name(static_cast<AVCodecID>(systemCodecInfo.avcodecId)),
-                             it.getName());
+                JAMI_WARNING("Failed to open AMF encoder {}", amfCodecName);
                 avcodec_free_context(&encoderCtx);
                 encoderCtx = nullptr;
-                accel_ = nullptr;
-                continue;
+                useAmfEncoder_ = false;
             } else {
-                // Succeed to open codec
-                JAMI_WARNING("Using hardware encoding for {} with {} ",
-                             avcodec_get_name(static_cast<AVCodecID>(systemCodecInfo.avcodecId)),
-                             it.getName());
+                JAMI_WARNING("Using AMF hardware encoding with {}", amfCodecName);
                 encoders_.emplace_back(encoderCtx);
-                break;
+            }
+        }
+#endif
+
+        if (!encoderCtx) {
+            auto APIs = video::HardwareAccel::getCompatibleAccel(static_cast<AVCodecID>(systemCodecInfo.avcodecId),
+                                                                 videoOpts_.width,
+                                                                 videoOpts_.height,
+                                                                 CODEC_ENCODER);
+            for (const auto& it : APIs) {
+                accel_ = std::make_unique<video::HardwareAccel>(it); // save accel
+                // Init codec need accel_ to init encoderCtx accelerated
+                encoderCtx = initCodec(mediaType,
+                                       static_cast<AVCodecID>(systemCodecInfo.avcodecId),
+                                       videoOpts_.bitrate);
+                encoderCtx->opaque = accel_.get();
+                // Check if pixel format from encoder match pixel format from decoder frame context
+                // if it mismatch, it means that we are using two different hardware API (nvenc and
+                // vaapi for example) in this case we don't want link the APIs
+                if (framesCtx) {
+                    auto* hw = reinterpret_cast<AVHWFramesContext*>(framesCtx->data);
+                    if (encoderCtx->pix_fmt != hw->format)
+                        linkableHW_ = false;
+                }
+                auto ret = accel_->initAPI(linkableHW_, framesCtx);
+                if (ret < 0) {
+                    accel_.reset();
+                    encoderCtx = nullptr;
+                    continue;
+                }
+                accel_->setDetails(encoderCtx);
+                if (avcodec_open2(encoderCtx, outputCodec_, &options_) < 0) {
+                    // Failed to open codec
+                    JAMI_WARNING("Fail to open hardware encoder {} with {} ",
+                                 avcodec_get_name(static_cast<AVCodecID>(systemCodecInfo.avcodecId)),
+                                 it.getName());
+                    avcodec_free_context(&encoderCtx);
+                    encoderCtx = nullptr;
+                    accel_ = nullptr;
+                    continue;
+                } else {
+                    // Succeed to open codec
+                    JAMI_WARNING("Using hardware encoding for {} with {} ",
+                                 avcodec_get_name(static_cast<AVCodecID>(systemCodecInfo.avcodecId)),
+                                 it.getName());
+                    encoders_.emplace_back(encoderCtx);
+                    break;
+                }
             }
         }
     }
@@ -661,15 +693,15 @@ MediaEncoder::forcePresetX2645(AVCodecContext* encoderCtx)
             JAMI_WARNING("Failed to set level to 'auto'");
         if (av_opt_set_int(encoderCtx, "zerolatency", 1, AV_OPT_SEARCH_CHILDREN))
             JAMI_WARNING("Failed to set zerolatency to '1'");
-    } else if (accel_ && accel_->getName() == "amf") {
+    } else if (useAmfEncoder_) {
         // AMF has its own rate-control and latency options; x264's preset and
-        // tune options are not meaningful for the AMF encoder.
-        if (av_opt_set(encoderCtx, "usage", "lowlatency_high_quality", AV_OPT_SEARCH_CHILDREN))
-            JAMI_WARNING("Failed to set AMF usage to 'lowlatency_high_quality'");
+        // tune options are not meaningful for the AMF encoder. The FFmpeg 6
+        // AMF backend calls this mode simply "lowlatency".
+        if (av_opt_set(encoderCtx, "usage", "lowlatency", AV_OPT_SEARCH_CHILDREN))
+            JAMI_WARNING("Failed to set AMF usage to 'lowlatency'");
         if (av_opt_set(encoderCtx, "quality", "balanced", AV_OPT_SEARCH_CHILDREN))
             JAMI_WARNING("Failed to set AMF quality to 'balanced'");
-        if (av_opt_set_int(encoderCtx, "bf", 0, AV_OPT_SEARCH_CHILDREN))
-            JAMI_WARNING("Failed to disable AMF B-frames");
+        encoderCtx->max_b_frames = 0;
     } else
 #endif
     {
@@ -746,6 +778,7 @@ MediaEncoder::enableAccel(bool enableAccel)
     enableAccel_ = enableAccel;
     emitSignal<libjami::ConfigurationSignal::HardwareEncodingChanged>(enableAccel_);
     if (!enableAccel_) {
+        useAmfEncoder_ = false;
         accel_.reset();
         for (auto* enc : encoders_)
             enc->opaque = nullptr;
@@ -794,7 +827,15 @@ MediaEncoder::initCodec(AVMediaType mediaType, AVCodecID avcodecId, uint64_t br)
 #ifdef ENABLE_HWACCEL
     if (mediaType == AVMEDIA_TYPE_VIDEO) {
         if (enableAccel_) {
-            if (accel_) {
+            if (useAmfEncoder_) {
+                const char* amfCodecName = nullptr;
+                if (avcodecId == AV_CODEC_ID_H264)
+                    amfCodecName = "h264_amf";
+                else if (avcodecId == AV_CODEC_ID_HEVC)
+                    amfCodecName = "hevc_amf";
+                if (amfCodecName)
+                    outputCodec_ = avcodec_find_encoder_by_name(amfCodecName);
+            } else if (accel_) {
                 outputCodec_ = avcodec_find_encoder_by_name(accel_->getCodecName().c_str());
             }
         } else {
@@ -1063,17 +1104,18 @@ MediaEncoder::initAccel(AVCodecContext* encoderCtx, uint64_t br)
 {
 #ifdef ENABLE_HWACCEL
     float val = static_cast<float>(br) * 1000.0f * 0.8f;
+    if (useAmfEncoder_) {
+        // Keep a deterministic CBR target for AMF. Runtime bitrate changes
+        // restart the encoder because this path has no dynamic-rate contract.
+        av_opt_set(encoderCtx, "rc", "cbr", AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(encoderCtx, "b", static_cast<int64_t>(val), AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(encoderCtx, "maxrate", static_cast<int64_t>(val), AV_OPT_SEARCH_CHILDREN);
+        return;
+    }
     if (not accel_)
         return;
     if (accel_->getName() == "nvenc"sv) {
         // Use same parameters as software
-    } else if (accel_->getName() == "amf"sv) {
-        // Keep a deterministic CBR target for the first AMF implementation.
-        // Runtime bitrate changes are deliberately disabled until they are
-        // verified on both AMD and Intel Windows test machines.
-        av_opt_set(encoderCtx, "rc", "cbr", AV_OPT_SEARCH_CHILDREN);
-        av_opt_set_int(encoderCtx, "b", static_cast<int64_t>(val), AV_OPT_SEARCH_CHILDREN);
-        av_opt_set_int(encoderCtx, "maxrate", static_cast<int64_t>(val), AV_OPT_SEARCH_CHILDREN);
     } else if (accel_->getName() == "vaapi"sv) {
         // Use VBR encoding with bitrate target set to 80% of the maxrate
         av_opt_set_int(encoderCtx, "crf", -1, AV_OPT_SEARCH_CHILDREN);
@@ -1128,6 +1170,8 @@ bool
 MediaEncoder::isDynBitrateSupported(AVCodecID codecid)
 {
 #ifdef ENABLE_HWACCEL
+    if (useAmfEncoder_)
+        return false;
     if (accel_) {
         return accel_->dynBitrate();
     }
@@ -1200,6 +1244,38 @@ MediaEncoder::testH265Accel()
 {
 #ifdef ENABLE_HWACCEL
     if (jami::Manager::instance().videoPreferences.getEncodingAccelerated()) {
+#ifdef _WIN32
+        // AMF is an FFmpeg encoder backend, not an AVHWDeviceType, so test it
+        // directly before probing the AVHWDevice-based encoders.
+        if (const auto* outputCodec = avcodec_find_encoder_by_name("hevc_amf")) {
+            auto* encoderCtx = avcodec_alloc_context3(outputCodec);
+            if (encoderCtx) {
+                encoderCtx->thread_count = static_cast<int>(std::min(std::thread::hardware_concurrency(), 16u));
+                encoderCtx->width = 1280;
+                encoderCtx->height = 720;
+                encoderCtx->framerate = AVRational {30, 1};
+                encoderCtx->time_base = av_inv_q(encoderCtx->framerate);
+                encoderCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+                encoderCtx->profile = FF_PROFILE_HEVC_MAIN;
+                av_opt_set(encoderCtx, "usage", "lowlatency", AV_OPT_SEARCH_CHILDREN);
+                av_opt_set(encoderCtx, "quality", "balanced", AV_OPT_SEARCH_CHILDREN);
+                av_opt_set(encoderCtx, "rc", "cbr", AV_OPT_SEARCH_CHILDREN);
+                auto br = static_cast<int64_t>(SystemCodecInfo::DEFAULT_VIDEO_BITRATE) * 1000;
+                av_opt_set_int(encoderCtx, "b", br, AV_OPT_SEARCH_CHILDREN);
+                av_opt_set_int(encoderCtx, "maxrate", br, AV_OPT_SEARCH_CHILDREN);
+                av_opt_set_int(encoderCtx, "bufsize", br / 2, AV_OPT_SEARCH_CHILDREN);
+
+                if (avcodec_open2(encoderCtx, outputCodec, nullptr) >= 0) {
+                    avcodec_free_context(&encoderCtx);
+                    JAMI_WARNING("AMF HEVC encoder test succeeded");
+                    return "amf";
+                }
+                JAMI_WARNING("AMF HEVC encoder test failed to open");
+                avcodec_free_context(&encoderCtx);
+            }
+        }
+#endif
+
         // Get compatible list of Hardware API
         auto APIs = video::HardwareAccel::getCompatibleAccel(AV_CODEC_ID_H265, 1280, 720, CODEC_ENCODER);
 

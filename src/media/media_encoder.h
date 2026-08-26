@@ -166,6 +166,10 @@ private:
 
 #ifdef ENABLE_HWACCEL
     bool enableAccel_ {false};
+    // FFmpeg 6 exposes AMD AMF as an encoder backend (h264_amf/hevc_amf),
+    // rather than as an AVHWDeviceType. AMF therefore uses software frames
+    // and is kept separate from HardwareAccel's frame-context pipeline.
+    bool useAmfEncoder_ {false};
     std::unique_ptr<video::HardwareAccel> accel_;
 #endif
 
