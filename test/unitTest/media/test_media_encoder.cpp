@@ -164,6 +164,7 @@ MediaEncoderTest::testMultiStream()
         int videoIdx = encoder_->addStream(*vp8Codec.get());
         CPPUNIT_ASSERT(videoIdx >= 0);
         CPPUNIT_ASSERT(videoIdx != audioIdx);
+        CPPUNIT_ASSERT(encoder_->setBitrate(1000) == MediaEncoder::BitrateChangeResult::UNSUPPORTED);
         encoder_->setIOContext(nullptr);
         int sentSamples = 0;
         AVFrame* audio = nullptr;

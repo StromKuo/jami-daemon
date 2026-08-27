@@ -105,15 +105,21 @@ VideoSender::setChangeOrientationCallback(std::function<void(int)> cb)
     changeOrientationCallback_ = std::move(cb);
 }
 
-int
+MediaEncoder::BitrateChangeResult
 VideoSender::setBitrate(uint64_t br)
 {
     // The encoder may be destroy during a bitrate change
     // when a codec parameter like auto quality change
     if (!videoEncoder_)
-        return -1; // NOK
+        return MediaEncoder::BitrateChangeResult::FAILED;
 
     return videoEncoder_->setBitrate(br);
+}
+
+bool
+VideoSender::supportsBitrateAdaptation()
+{
+    return videoEncoder_ && videoEncoder_->supportsBitrateAdaptation();
 }
 
 } // namespace video

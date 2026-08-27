@@ -247,9 +247,10 @@ VideoRtpSession::startSender()
         lastMediaRestart_ = clock::now();
         last_REMB_inc_ = clock::now();
         last_REMB_dec_ = clock::now();
-        if (autoQuality and not rtcpCheckerThread_.isRunning())
+        const auto bitrateAdaptationSupported = sender_ && sender_->supportsBitrateAdaptation();
+        if (autoQuality and bitrateAdaptationSupported and not rtcpCheckerThread_.isRunning())
             rtcpCheckerThread_.start();
-        else if (not autoQuality and rtcpCheckerThread_.isRunning())
+        else if ((not autoQuality or not bitrateAdaptationSupported) and rtcpCheckerThread_.isRunning())
             rtcpCheckerThread_.join();
         // Block reads to received feedback packets
         if (socketPair_)
@@ -775,27 +776,35 @@ VideoRtpSession::setNewBitrate(unsigned int newBR)
     newBR = std::max(newBR, videoBitrateInfo_.videoBitrateMin);
     newBR = std::min(newBR, videoBitrateInfo_.videoBitrateMax);
 
+    if (videoBitrateInfo_.videoBitrateCurrent == newBR)
+        return;
+
+    if (not sender_) {
+        JAMI_ERROR("Fail to access the sender");
+        return;
+    }
+
+    const auto ret = sender_->setBitrate(newBR);
+    if (ret == MediaEncoder::BitrateChangeResult::FAILED) {
+        JAMI_ERROR("Fail to access the encoder");
+        return;
+    }
+    if (ret == MediaEncoder::BitrateChangeResult::UNSUPPORTED) {
+        JAMI_WARNING("[BandwidthAdapt] Ignoring bitrate update because the active encoder does not support it");
+        return;
+    }
+
     if (newBR < videoBitrateInfo_.videoBitrateCurrent)
         lastBitrateDecrease = clock::now();
-
-    if (videoBitrateInfo_.videoBitrateCurrent != newBR) {
-        videoBitrateInfo_.videoBitrateCurrent = newBR;
+    videoBitrateInfo_.videoBitrateCurrent = newBR;
 
 #if __ANDROID__
-        if (auto input_device = std::dynamic_pointer_cast<VideoInput>(videoLocal_))
-            emitSignal<libjami::VideoSignal::SetBitrate>(input_device->getConfig().name, (int) newBR);
+    if (auto input_device = std::dynamic_pointer_cast<VideoInput>(videoLocal_))
+        emitSignal<libjami::VideoSignal::SetBitrate>(input_device->getConfig().name, (int) newBR);
 #endif
 
-        if (sender_) {
-            auto ret = sender_->setBitrate(newBR);
-            if (ret == -1)
-                JAMI_ERROR("Fail to access the encoder");
-            else if (ret == 0)
-                restartSender();
-        } else {
-            JAMI_ERROR("Fail to access the sender");
-        }
-    }
+    if (ret == MediaEncoder::BitrateChangeResult::RESTART_REQUIRED)
+        restartSender();
 }
 
 void

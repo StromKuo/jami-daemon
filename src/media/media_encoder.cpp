@@ -901,18 +901,24 @@ MediaEncoder::initCodec(AVMediaType mediaType, AVCodecID avcodecId, uint64_t br)
     return encoderCtx;
 }
 
-int
+MediaEncoder::BitrateChangeResult
 MediaEncoder::setBitrate(uint64_t br)
 {
     std::lock_guard lk(encMutex_);
     AVCodecContext* encoderCtx = getCurrentVideoAVCtx();
     if (not encoderCtx)
-        return -1; // NOK
+        return BitrateChangeResult::FAILED;
 
     AVCodecID codecId = encoderCtx->codec_id;
 
-    if (not isDynBitrateSupported(codecId))
-        return 0; // Restart needed
+    if (not isDynBitrateSupported(codecId)) {
+        // Reopening a libvpx encoder while the RTP stream is active is not
+        // supported. Treat this as an unsupported update instead of asking
+        // VideoRtpSession to restart the sender for every RTCP bitrate change.
+        if (codecId == AV_CODEC_ID_VP8)
+            return BitrateChangeResult::UNSUPPORTED;
+        return BitrateChangeResult::RESTART_REQUIRED;
+    }
 
     // No need to restart encoder for h264, h263 and MPEG4
     // Change parameters on the fly
@@ -932,7 +938,20 @@ MediaEncoder::setBitrate(uint64_t br)
         //     throw MediaEncoderException("Unable to open encoder");
     }
     initAccel(encoderCtx, br);
-    return 1; // OK
+    return BitrateChangeResult::UPDATED;
+}
+
+bool
+MediaEncoder::supportsBitrateAdaptation()
+{
+    std::lock_guard lk(encMutex_);
+    AVCodecContext* encoderCtx = getCurrentVideoAVCtx();
+    if (not encoderCtx)
+        return false;
+
+    // VP8 has no safe runtime restart path. Hardware VP8 encoders that expose
+    // dynamic bitrate updates remain eligible for adaptation.
+    return encoderCtx->codec_id != AV_CODEC_ID_VP8 || isDynBitrateSupported(encoderCtx->codec_id);
 }
 
 int

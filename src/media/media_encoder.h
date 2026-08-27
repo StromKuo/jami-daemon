@@ -66,6 +66,13 @@ public:
 class MediaEncoder
 {
 public:
+    enum class BitrateChangeResult : int {
+        FAILED = -1,
+        RESTART_REQUIRED = 0,
+        UPDATED = 1,
+        UNSUPPORTED = 2,
+    };
+
     MediaEncoder();
     ~MediaEncoder();
 
@@ -100,7 +107,8 @@ public:
     void setInitSeqVal(uint16_t seqVal);
     uint16_t getLastSeqValue();
 
-    int setBitrate(uint64_t br);
+    BitrateChangeResult setBitrate(uint64_t br);
+    bool supportsBitrateAdaptation();
     int setPacketLoss(uint64_t pl);
 
 #ifdef ENABLE_HWACCEL
