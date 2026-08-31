@@ -17,10 +17,15 @@
 
 #include "aaudiolayer.h"
 #include "logger.h"
+#include "manager.h"
 
 #include <aaudio/AAudio.h>
 #include <dlfcn.h>
 
+#include <cstring>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
 #include <string>
 
 namespace jami {
@@ -29,12 +34,17 @@ namespace jami {
 using SetUsageFunc = void (*)(AAudioStreamBuilder*, aaudio_usage_t);
 using SetContentTypeFunc = void (*)(AAudioStreamBuilder*, aaudio_content_type_t);
 using SetInputPresetFunc = void (*)(AAudioStreamBuilder*, aaudio_input_preset_t);
+using SetDeviceIdFunc = void (*)(AAudioStreamBuilder*, int32_t);
 
 // Set once from JNI_OnLoad; used to create the Java AudioTrack fallback on API < 28.
 static JavaVM* sJavaVM {nullptr};
+// AudioDeviceInfo IDs are owned by Android's audio policy service. Keep only
+// the current value here; the next capture stream will apply it to AAudio.
+static std::atomic<int32_t> sPreferredInputDeviceId {-1};
 
 AAudioLayer::AAudioLayer(const AudioPreference& pref)
     : AudioLayer(pref)
+    , usbUacCapture_(std::make_unique<UsbUacCapture>())
 {
     setHasNativeAEC(true);
     setHasNativeNS(true);
@@ -44,6 +54,47 @@ void
 AAudioLayer::setJavaVM(JavaVM* vm)
 {
     sJavaVM = vm;
+}
+
+void
+setPreferredInputDevice(int32_t deviceId)
+{
+    sPreferredInputDeviceId.store(deviceId, std::memory_order_relaxed);
+    JAMI_WARNING("AAudio preferred capture device set to {}", deviceId);
+}
+
+bool
+startUsbUacCapture(int fileDescriptor,
+                   int interfaceNumber,
+                   int alternateSetting,
+                   int endpointAddress,
+                   int packetSize)
+{
+    auto layer = std::dynamic_pointer_cast<AAudioLayer>(Manager::instance().getAudioDriver());
+    if (!layer) {
+        JAMI_ERROR("USB UAC: Android AAudio layer is not available");
+        return false;
+    }
+    return layer->startUsbUacCapture(fileDescriptor,
+                                     interfaceNumber,
+                                     alternateSetting,
+                                     endpointAddress,
+                                     packetSize);
+}
+
+void
+stopUsbUacCapture()
+{
+    auto layer = std::dynamic_pointer_cast<AAudioLayer>(Manager::instance().getAudioDriver());
+    if (layer)
+        layer->stopUsbUacCapture();
+}
+
+bool
+isUsbUacCaptureActive()
+{
+    auto layer = std::dynamic_pointer_cast<AAudioLayer>(Manager::instance().getAudioDriver());
+    return layer && layer->isUsbUacCaptureActive();
 }
 
 AAudioLayer::~AAudioLayer()
@@ -56,6 +107,125 @@ AAudioLayer::~AAudioLayer()
     if (loopThread_.joinable())
         loopThread_.join();
     stopStream(AudioDeviceType::ALL);
+}
+
+bool
+AAudioLayer::startUsbUacCapture(int fileDescriptor,
+                                int interfaceNumber,
+                                int alternateSetting,
+                                int endpointAddress,
+                                int packetSize)
+{
+    std::lock_guard lock(mutex_);
+
+    if (recStream_) {
+        AAudioStream_requestStop(recStream_.get());
+        recStream_.reset();
+    }
+    if (recordStarted_)
+        recordChanged(false);
+
+    hardwareInputFormatAvailable(AudioFormat(48000, 2, AV_SAMPLE_FMT_S16));
+    usbUacPcmCallbacks_.store(0, std::memory_order_relaxed);
+    usbUacPcmBytes_.store(0, std::memory_order_relaxed);
+    usbUacPcmFrames_.store(0, std::memory_order_relaxed);
+    usbUacPcmDropped_.store(0, std::memory_order_relaxed);
+    recordChanged(true);
+    usbUacCaptureActive_.store(true, std::memory_order_release);
+
+    const auto started = usbUacCapture_->start(
+        fileDescriptor,
+        interfaceNumber,
+        alternateSetting,
+        endpointAddress,
+        packetSize,
+        [this](const uint8_t* data, size_t size) {
+            if (usbUacCaptureActive_.load(std::memory_order_acquire)) {
+                auto format = AudioFormat(48000, 2, AV_SAMPLE_FMT_S16);
+                auto bytesPerFrame = format.getBytesPerFrame();
+                auto frameCount = size / bytesPerFrame;
+                if (frameCount == 0)
+                    return;
+                auto frame = std::make_shared<AudioFrame>(format, frameCount);
+                if (!frame->pointer() || !frame->pointer()->data[0])
+                    return;
+                std::memcpy(frame->pointer()->data[0], data, frameCount * bytesPerFrame);
+                const auto callbacks = usbUacPcmCallbacks_.fetch_add(1, std::memory_order_relaxed) + 1;
+                usbUacPcmBytes_.fetch_add(frameCount * bytesPerFrame, std::memory_order_relaxed);
+                usbUacPcmFrames_.fetch_add(frameCount, std::memory_order_relaxed);
+                if (callbacks == 1 || callbacks % 125 == 0) {
+                    const auto* samples = reinterpret_cast<const int16_t*>(data);
+                    const auto sampleCount = frameCount * format.nb_channels;
+                    const auto sampleStep = std::max<size_t>(1, sampleCount / 512);
+                    int peak = 0;
+                    long double sumSquares = 0;
+                    size_t sampled = 0;
+                    for (size_t i = 0; i < sampleCount; i += sampleStep) {
+                        const auto value = static_cast<int>(samples[i]);
+                        peak = std::max(peak, std::abs(value));
+                        sumSquares += static_cast<long double>(value) * value;
+                        ++sampled;
+                    }
+                    const auto rms = sampled ? std::sqrt(static_cast<double>(sumSquares / sampled)) : 0.0;
+                    JAMI_WARNING("[USB UAC PCM] callbacks={} bytes={} frames={} lastFrames={} peak={} rms={:.1f}",
+                                 callbacks,
+                                 usbUacPcmBytes_.load(std::memory_order_relaxed),
+                                 usbUacPcmFrames_.load(std::memory_order_relaxed),
+                                 frameCount,
+                                 peak,
+                                 rms);
+                }
+                const auto dispatchStart = std::chrono::steady_clock::now();
+                putRecorded(std::move(frame));
+                const auto dispatchUs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - dispatchStart).count());
+                if (dispatchUs >= 20000)
+                    JAMI_WARNING("[USB UAC PCM] putRecorded took {:.2f}ms for {} frames", static_cast<double>(dispatchUs) / 1000.0, frameCount);
+            } else {
+                const auto dropped = usbUacPcmDropped_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (dropped == 1 || dropped % 250 == 0)
+                    JAMI_WARNING("[USB UAC PCM] dropped callback={} because capture is inactive", dropped);
+            }
+        });
+    if (!started) {
+        usbUacCaptureActive_.store(false, std::memory_order_release);
+        recordChanged(false);
+        return false;
+    }
+
+    if (!isRunning_) {
+        isRunning_ = true;
+        loopThread_ = std::thread([this] { loop(); });
+    }
+    JAMI_WARNING("USB UAC: application capture is active at 48000 Hz, 2 channels, signed 16-bit PCM, nativeRunning={}",
+                 usbUacCapture_->isRunning());
+    return true;
+}
+
+void
+AAudioLayer::stopUsbUacCapture()
+{
+    std::lock_guard lock(mutex_);
+    usbUacCaptureActive_.store(false, std::memory_order_release);
+    usbUacCapture_->stop();
+    if (recStream_) {
+        AAudioStream_requestStop(recStream_.get());
+        recStream_.reset();
+    }
+    if (recordStarted_)
+        recordChanged(false);
+    JAMI_WARNING("USB UAC: application capture stopped ({} callbacks, {} frames, {} bytes, {} dropped)",
+                 usbUacPcmCallbacks_.load(std::memory_order_relaxed),
+                 usbUacPcmFrames_.load(std::memory_order_relaxed),
+                 usbUacPcmBytes_.load(std::memory_order_relaxed),
+                 usbUacPcmDropped_.load(std::memory_order_relaxed));
+}
+
+bool
+AAudioLayer::isUsbUacCaptureActive() const
+{
+    return usbUacCaptureActive_.load(std::memory_order_acquire)
+           && usbUacCapture_ && usbUacCapture_->isRunning();
 }
 
 void
@@ -107,6 +277,8 @@ AAudioLayer::buildStream(AudioDeviceType type)
         dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setContentType"));
     static auto setInputPreset = reinterpret_cast<SetInputPresetFunc>(
         dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setInputPreset"));
+    static auto setDeviceId = reinterpret_cast<SetDeviceIdFunc>(
+        dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setDeviceId"));
     if (setUsage) {
         setUsage(builder,
                  type == AudioDeviceType::RINGTONE ? AAUDIO_USAGE_NOTIFICATION_RINGTONE
@@ -125,6 +297,18 @@ AAudioLayer::buildStream(AudioDeviceType type)
             setInputPreset(builder, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
         } else {
             JAMI_WARNING("AAudioStreamBuilder_setInputPreset not available, input preset will be unknown");
+        }
+
+        const auto preferredDeviceId = sPreferredInputDeviceId.load(std::memory_order_relaxed);
+        if (preferredDeviceId >= 0) {
+            if (setDeviceId) {
+                setDeviceId(builder, preferredDeviceId);
+                JAMI_WARNING("Opening capture stream on Android device ID {}", preferredDeviceId);
+            } else {
+                JAMI_WARNING("AAudioStreamBuilder_setDeviceId not available, using default capture device");
+            }
+        } else {
+            JAMI_WARNING("No preferred Android capture device, using platform default");
         }
     }
 
@@ -146,6 +330,10 @@ AAudioLayer::buildStream(AudioDeviceType type)
                    (type == AudioDeviceType::CAPTURE) ? "capture" : "playback",
                    AAudio_convertResultToText(result));
         return nullptr;
+    }
+
+    if (type == AudioDeviceType::CAPTURE) {
+        JAMI_WARNING("Capture stream opened on Android device ID {}", AAudioStream_getDeviceId(streamptr));
     }
     return AAudioStreamPtr(streamptr);
 }
@@ -228,6 +416,18 @@ AAudioLayer::startStreamLocked(AudioDeviceType stream)
             JAMI_ERROR("Error starting ringtone stream: {}", AAudio_convertResultToText(result));
         }
     } else if (stream == AudioDeviceType::CAPTURE) {
+        if (usbUacCaptureActive_.load(std::memory_order_acquire)
+            && !usbUacCapture_->isRunning()) {
+            JAMI_ERROR("USB UAC: capture worker stopped; falling back to AAudio microphone");
+            usbUacCaptureActive_.store(false, std::memory_order_release);
+            usbUacCapture_->stop();
+            if (recordStarted_)
+                recordChanged(false);
+        }
+        if (isUsbUacCaptureActive()) {
+            JAMI_WARNING("Capture stream is already provided by application USB UAC");
+            return;
+        }
         if (recStream_)
             return;
         recStream_ = buildStream(AudioDeviceType::CAPTURE);
@@ -291,6 +491,12 @@ AAudioLayer::stopStreamLocked(AudioDeviceType stream)
             AAudioStream_requestStop(recStream_.get());
             recStream_.reset();
             recordChanged(false);
+        }
+        if (usbUacCaptureActive_.load(std::memory_order_acquire)) {
+            usbUacCaptureActive_.store(false, std::memory_order_release);
+            usbUacCapture_->stop();
+            if (recordStarted_)
+                recordChanged(false);
         }
     }
     status_ = Status::Idle;

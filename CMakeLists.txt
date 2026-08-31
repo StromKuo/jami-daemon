@@ -359,6 +359,7 @@ if (ANDROID)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/androidvideo/video_device_impl.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/androidvideo/video_device_monitor_impl.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/aaudio/aaudiolayer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/aaudio/usb_uac_capture.cpp
     )
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if (JAMI_VIDEO)

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "audio/audiolayer.h"
+#include "usb_uac_capture.h"
 
 #include <aaudio/AAudio.h>
 #include <jni.h>
@@ -28,6 +29,18 @@
 #include <vector>
 
 namespace jami {
+
+// Set the Android AudioDeviceInfo ID to use for capture. A value below zero
+// means that the platform default input should be used.
+void setPreferredInputDevice(int32_t deviceId);
+
+bool startUsbUacCapture(int fileDescriptor,
+                        int interfaceNumber,
+                        int alternateSetting,
+                        int endpointAddress,
+                        int packetSize);
+void stopUsbUacCapture();
+bool isUsbUacCaptureActive();
 
 class AAudioLayer : public AudioLayer
 {
@@ -53,6 +66,14 @@ public:
     int getIndexRingtone() const override { return 0; }
 
     void updatePreference(AudioPreference& pref, int index, AudioDeviceType type) override;
+
+    bool startUsbUacCapture(int fileDescriptor,
+                            int interfaceNumber,
+                            int alternateSetting,
+                            int endpointAddress,
+                            int packetSize);
+    void stopUsbUacCapture();
+    bool isUsbUacCaptureActive() const;
 
 private:
     struct AAudioStreamDeleter
@@ -101,6 +122,13 @@ private:
     jfloatArray javaRingBuffer_ {nullptr}; // GlobalRef, reused each write
     std::atomic<bool> javaRingRunning_ {false};
     std::thread javaRingThread_;
+
+    std::unique_ptr<UsbUacCapture> usbUacCapture_;
+    std::atomic_bool usbUacCaptureActive_ {false};
+    std::atomic_uint64_t usbUacPcmCallbacks_ {0};
+    std::atomic_uint64_t usbUacPcmBytes_ {0};
+    std::atomic_uint64_t usbUacPcmFrames_ {0};
+    std::atomic_uint64_t usbUacPcmDropped_ {0};
 };
 
 } // namespace jami

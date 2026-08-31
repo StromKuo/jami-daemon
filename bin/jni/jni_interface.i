@@ -219,6 +219,17 @@ namespace std {
  * that are not declared elsewhere in the c++ code
  */
 
+namespace jami {
+void setPreferredInputDevice(int deviceId);
+bool startUsbUacCapture(int fileDescriptor,
+                        int interfaceNumber,
+                        int alternateSetting,
+                        int endpointAddress,
+                        int packetSize);
+void stopUsbUacCapture();
+bool isUsbUacCaptureActive();
+}
+
 void init(ConfigurationCallback* confM, Callback* callM, PresenceCallback* presM, DataTransferCallback* dataM, VideoCallback* videoM, ConversationCallback* convM, NetworkServiceCallback* nsMgr) {
     using namespace std::placeholders;
 
